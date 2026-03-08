@@ -3,6 +3,8 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import { calcTotpNow } from '@/lib/crypto';
 import { computeSshFingerprint, generateDefaultSshKeyMaterial } from '@/lib/ssh';
 import {
+  ArrowUpDown,
+  Check,
   CheckCheck,
   Clipboard,
   CreditCard,
@@ -52,6 +54,7 @@ interface VaultPageProps {
 }
 
 type TypeFilter = 'login' | 'card' | 'identity' | 'note' | 'ssh';
+type VaultSortMode = 'edited' | 'created' | 'name';
 type SidebarFilter =
   | { kind: 'all' }
   | { kind: 'favorite' }
@@ -70,6 +73,13 @@ const CREATE_TYPE_OPTIONS: TypeOption[] = [
   { type: 4, label: t('txt_identity') },
   { type: 2, label: t('txt_note') },
   { type: 5, label: t('txt_ssh_key') },
+];
+
+const VAULT_SORT_STORAGE_KEY = 'nodewarden.vault.sort.v1';
+const VAULT_SORT_OPTIONS: Array<{ value: VaultSortMode; label: string }> = [
+  { value: 'edited', label: t('txt_sort_last_edited') },
+  { value: 'created', label: t('txt_sort_created') },
+  { value: 'name', label: t('txt_sort_name') },
 ];
 
 function CreateTypeIcon({ type }: { type: number }) {
@@ -292,6 +302,20 @@ function formatAttachmentSize(attachment: CipherAttachment): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function sortTimeValue(cipher: Cipher): number {
+  const candidates = [cipher.revisionDate, cipher.creationDate];
+  for (const value of candidates) {
+    const time = new Date(String(value || '')).getTime();
+    if (Number.isFinite(time)) return time;
+  }
+  return 0;
+}
+
+function creationTimeValue(cipher: Cipher): number {
+  const time = new Date(String(cipher.creationDate || '')).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
 function firstPasskeyCreationTime(cipher: Cipher | null): string | null {
   const credentials = cipher?.login?.fido2Credentials;
   if (!Array.isArray(credentials) || credentials.length === 0) return null;
@@ -344,6 +368,8 @@ export default function VaultPage(props: VaultPageProps) {
   const [searchInput, setSearchInput] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [searchComposing, setSearchComposing] = useState(false);
+  const [sortMode, setSortMode] = useState<VaultSortMode>('edited');
+  const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>({ kind: 'all' });
   const [selectedCipherId, setSelectedCipherId] = useState('');
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
@@ -373,6 +399,7 @@ export default function VaultPage(props: VaultPageProps) {
   const [repromptPassword, setRepromptPassword] = useState('');
   const [repromptApprovedCipherId, setRepromptApprovedCipherId] = useState<string | null>(null);
   const createMenuRef = useRef<HTMLDivElement | null>(null);
+  const sortMenuRef = useRef<HTMLDivElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const sshSeedTicketRef = useRef(0);
   const sshFingerprintTicketRef = useRef(0);
@@ -384,6 +411,25 @@ export default function VaultPage(props: VaultPageProps) {
     window.addEventListener('nodewarden:add-item', onQuickAdd);
     return () => window.removeEventListener('nodewarden:add-item', onQuickAdd);
   }, []);
+
+  useEffect(() => {
+    try {
+      const saved = String(localStorage.getItem(VAULT_SORT_STORAGE_KEY) || '').trim() as VaultSortMode;
+      if (saved === 'edited' || saved === 'created' || saved === 'name') {
+        setSortMode(saved);
+      }
+    } catch {
+      // ignore storage read failures
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(VAULT_SORT_STORAGE_KEY, sortMode);
+    } catch {
+      // ignore storage write failures
+    }
+  }, [sortMode]);
 
   useEffect(() => {
     const onPointerDown = (event: Event) => {
@@ -405,6 +451,25 @@ export default function VaultPage(props: VaultPageProps) {
   }, [createMenuOpen]);
 
   useEffect(() => {
+    const onPointerDown = (event: Event) => {
+      if (!sortMenuOpen) return;
+      const target = event.target as Node | null;
+      if (sortMenuRef.current && target && !sortMenuRef.current.contains(target)) {
+        setSortMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSortMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [sortMenuOpen]);
+
+  useEffect(() => {
     setRepromptApprovedCipherId(null);
     setRepromptPassword('');
     setRepromptOpen(false);
@@ -422,7 +487,7 @@ export default function VaultPage(props: VaultPageProps) {
   }, [isEditing, draft?.id, draft?.type]);
 
   const filteredCiphers = useMemo(() => {
-    return props.ciphers.filter((cipher) => {
+    const next = props.ciphers.filter((cipher) => {
       const isDeleted = !!(cipher.deletedDate || (cipher as any).deletedAt);
       if (sidebarFilter.kind === 'trash') {
         if (!isDeleted) return false;
@@ -444,7 +509,27 @@ export default function VaultPage(props: VaultPageProps) {
       const uri = firstCipherUri(cipher).toLowerCase();
       return name.includes(searchQuery) || username.includes(searchQuery) || uri.includes(searchQuery);
     });
-  }, [props.ciphers, sidebarFilter, searchQuery]);
+
+    next.sort((a, b) => {
+      if (sortMode === 'edited') {
+        const diff = sortTimeValue(b) - sortTimeValue(a);
+        if (diff !== 0) return diff;
+      } else if (sortMode === 'created') {
+        const diff = creationTimeValue(b) - creationTimeValue(a);
+        if (diff !== 0) return diff;
+      } else {
+        const nameDiff = String(a.decName || a.name || '').localeCompare(String(b.decName || b.name || ''), undefined, {
+          sensitivity: 'base',
+          numeric: true,
+        });
+        if (nameDiff !== 0) return nameDiff;
+      }
+
+      return String(a.id || '').localeCompare(String(b.id || ''));
+    });
+
+    return next;
+  }, [props.ciphers, sidebarFilter, searchQuery, sortMode]);
 
   useEffect(() => {
     if (isCreating) return;
@@ -864,6 +949,35 @@ function folderName(id: string | null | undefined): string {
                 setSearchInput((e.currentTarget as HTMLInputElement).value);
               }}
             />
+            <div className="sort-menu-wrap" ref={sortMenuRef}>
+              <button
+                type="button"
+                className={`btn btn-secondary small sort-trigger ${sortMenuOpen ? 'active' : ''}`}
+                aria-label={t('txt_sort')}
+                title={t('txt_sort')}
+                onClick={() => setSortMenuOpen((open) => !open)}
+              >
+                <ArrowUpDown size={14} className="btn-icon" />
+              </button>
+              {sortMenuOpen && (
+                <div className="sort-menu">
+                  {VAULT_SORT_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`sort-menu-item ${sortMode === option.value ? 'active' : ''}`}
+                      onClick={() => {
+                        setSortMode(option.value);
+                        setSortMenuOpen(false);
+                      }}
+                    >
+                      <span>{option.label}</span>
+                      {sortMode === option.value ? <Check size={14} /> : <span className="sort-menu-check-placeholder" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button type="button" className="btn btn-secondary small" disabled={busy || props.loading} onClick={() => void syncVault()}>
               <RefreshCw size={14} className="btn-icon" /> {t('txt_sync_vault')}
             </button>
